@@ -47,19 +47,17 @@ class GPT2Model(GPTPreTrainedModel):
     input_shape = input_ids.size()
     seq_length = input_shape[1]
 
-    inputs_embeds = None
+    # Get word embeddings from input token ids
+    inputs_embeds = self.word_embedding(input_ids)
 
-    ### YOUR CODE HERE
-    raise NotImplementedError
-
-
+    # Get position ids and position embeddings
     pos_ids = self.position_ids[:, :seq_length]
-    pos_embeds = None
+    pos_embeds = self.pos_embedding(pos_ids)
 
-    ### TODO: Use pos_ids to get position embedding from self.pos_embedding into pos_embeds.
-    ###       Then, add two embeddings together; then apply dropout and return.
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    # Add word embeddings and position embeddings, then apply dropout
+    embeddings = inputs_embeds + pos_embeds
+    embeddings = self.embed_dropout(embeddings)
+    return embeddings
 
 
   def encode(self, hidden_states, attention_mask):
@@ -93,8 +91,8 @@ class GPT2Model(GPTPreTrainedModel):
     sequence_output = self.final_layer_norm(sequence_output)
 
     # Get the hidden state of the final token.
-    last_non_pad_idx = attention_mask.sum(dim=1) - 1  # Subtract 1 to get last index
-    last_token = sequence_output[torch.arange(sequence_output.shape[0]), last_non_pad_idx]
+    last_non_pad_idx = (attention_mask.sum(dim=1) - 1).long()  # Subtract 1 to get last index
+    last_token = sequence_output[torch.arange(sequence_output.shape[0], device=sequence_output.device), last_non_pad_idx]
 
     return {'last_hidden_state': sequence_output, 'last_token': last_token}
 
@@ -106,7 +104,10 @@ class GPT2Model(GPTPreTrainedModel):
       return hidden_state(s) * E^T
     """
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # hidden_state: [batch_size, seq_len, hidden_size] or [batch_size, hidden_size]
+    # word_embedding.weight: [vocab_size, hidden_size]
+    # Output: [batch_size, seq_len, vocab_size] or [batch_size, vocab_size]
+    return torch.matmul(hidden_state, self.word_embedding.weight.T)
 
 
   @classmethod

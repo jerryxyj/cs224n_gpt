@@ -61,7 +61,48 @@ class AdamW(Optimizer):
                 ###
                 ###       Refer to the default project handout for more details.
                 ### YOUR CODE HERE
-                raise NotImplementedError
+
+                # Get hyperparameters
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+                correct_bias = group["correct_bias"]
+
+                # Initialize state if first step
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p.data)  # First moment (mean)
+                    state["v"] = torch.zeros_like(p.data)  # Second moment (variance)
+
+                # Increment step count
+                state["step"] += 1
+                t = state["step"]
+
+                # Get current moments
+                m = state["m"]
+                v = state["v"]
+
+                # 1. Update first and second moments of the gradients
+                # m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
+                m.mul_(beta1).add_(grad, alpha=1 - beta1)
+                # v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
+                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # 2. Apply bias correction (efficient version)
+                if correct_bias:
+                    # Bias-corrected learning rate
+                    bias_correction1 = 1 - beta1 ** t
+                    bias_correction2 = 1 - beta2 ** t
+                    alpha_t = alpha * math.sqrt(bias_correction2) / bias_correction1
+                else:
+                    alpha_t = alpha
+
+                # 3. Update parameters: p = p - alpha_t * m / (sqrt(v) + eps)
+                p.data.addcdiv_(m, v.sqrt().add_(eps), value=-alpha_t)
+
+                # 4. Apply weight decay after the main gradient-based updates (AdamW style)
+                if weight_decay > 0.0:
+                    p.data.add_(p.data, alpha=-alpha * weight_decay)
 
 
         return loss

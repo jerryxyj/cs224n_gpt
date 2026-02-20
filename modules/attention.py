@@ -32,9 +32,46 @@ class CausalSelfAttention(nn.Module):
     return proj
 
   def attention(self, key, query, value, attention_mask):
-
+    """
+    Compute scaled dot-product attention.
+    key, query, value: [bs, num_attention_heads, seq_len, attention_head_size]
+    attention_mask: [bs, 1, 1, seq_len]
+    output: [bs, seq_len, hidden_state]
+    """
     ### YOUR CODE HERE
-    raise NotImplementedError
+    # Compute attention scores: Q * K^T / sqrt(d_k)
+    # Shape: [bs, num_attention_heads, seq_len, seq_len]
+    attention_scores = torch.matmul(query, key.transpose(-1, -2))
+    attention_scores = attention_scores / (self.attention_head_size ** 0.5)
+
+    # Create causal mask: lower triangular matrix
+    seq_len = query.size(2)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=query.device, dtype=query.dtype))
+    # Convert to attention mask format: 0 for valid, large negative for masked
+    causal_mask = (1.0 - causal_mask) * -10000.0
+    # Expand to [1, 1, seq_len, seq_len] for broadcasting
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+
+    # Apply causal mask
+    attention_scores = attention_scores + causal_mask
+
+    # Apply the padding attention mask (mask has 0 for valid positions, large negative for masked)
+    attention_scores = attention_scores + attention_mask
+
+    # Normalize the attention scores to probabilities
+    attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+
+    # Apply dropout
+    attention_probs = self.dropout(attention_probs)
+
+    # Compute context: attention_probs * V
+    # Shape: [bs, num_attention_heads, seq_len, attention_head_size]
+    context = torch.matmul(attention_probs, value)
+
+    # Reshape back to [bs, seq_len, hidden_state]
+    context = rearrange(context, 'b h t d -> b t (h d)')
+
+    return context
 
 
   def forward(self, hidden_states, attention_mask):
