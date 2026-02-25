@@ -61,7 +61,17 @@ class SonnetGPT(nn.Module):
     not just the distribution over next tokens for the last token!
     """
     ### YOUR CODE HERE
-    raise NotImplementedError
+    """
+    Produces logits for each token position in the sequence.
+    """
+    # Get hidden states from GPT-2: (batch, seq_len, d)
+    hidden_states = self.gpt(input_ids, attention_mask)
+
+    # Project hidden states to vocabulary logits using the token embedding matrix (weight tying)
+    # Embedding weight shape: (vocab_size, d)
+    logits = torch.matmul(hidden_states, self.gpt.gpt.wte.weight.T)  # (batch, seq_len, vocab_size)
+
+    return logits
 
 
   def get_device(self):
