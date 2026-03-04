@@ -265,9 +265,9 @@ def add_arguments(args):
     args.l = 36
     args.num_heads = 20
   elif args.model_size == 'gpt2-xl':
-    args.d = 1536
+    args.d = 1600
     args.l = 48
-    args.num_heads = 24
+    args.num_heads = 25
   else:
     raise Exception(f'{args.model_size} is not supported.')
   return args
