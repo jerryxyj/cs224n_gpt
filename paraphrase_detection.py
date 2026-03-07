@@ -12,6 +12,8 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 '''
 
 import argparse
+import csv
+import math
 import random
 import torch
 
@@ -19,6 +21,7 @@ import numpy as np
 import torch.nn.functional as F
 
 from torch import nn
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -43,6 +46,56 @@ def seed_everything(seed=11711):
   torch.cuda.manual_seed_all(seed)
   torch.backends.cudnn.benchmark = False
   torch.backends.cudnn.deterministic = True
+
+def bytes_to_mib(x):
+    return x / (1024 ** 2)
+
+# Utility class to track GPU time and memory usage. You can use this to report the GPU time and memory usage of your model in your writeup.
+class GpuMeter:
+  def __init__(self, device):
+    self.enabled = device.type == "cuda"
+    print("GPU meter enabled: ", self.enabled)
+    if self.enabled:
+      self.start = torch.cuda.Event(enable_timing=True)
+      self.end = torch.cuda.Event(enable_timing=True)
+
+    self.step_time_sum = 0.0
+    self.step_count = 0
+
+  def reset_epoch(self):
+    self.step_time_sum = 0.0
+    self.step_count = 0
+
+    if self.enabled:
+      torch.cuda.reset_peak_memory_stats()
+
+  def step_start(self):
+    if self.enabled:
+      self.start.record()
+
+  def step_end(self):
+    if self.enabled:
+      self.end.record()
+      torch.cuda.synchronize()
+
+      self.step_time_sum += self.start.elapsed_time(self.end)
+      self.step_count += 1
+
+  def get_stats(self):
+    if not self.enabled:
+      return None
+
+    peak_alloc = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+
+    avg_step = self.step_time_sum / max(1, self.step_count)
+
+    return {
+      "epoch_gpu_time_s": self.step_time_sum / 1000,
+      "avg_step_time_ms": avg_step,
+      "peak_alloc_mib": bytes_to_mib(peak_alloc),
+      "peak_reserved_mib": bytes_to_mib(peak_reserved)
+    }
 
 
 class ParaphraseGPT(nn.Module):
@@ -95,6 +148,7 @@ def save_model(model, optimizer, args, filepath):
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  print("Device:", device)
   # Create the data and its corresponding datasets and dataloader.
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
@@ -110,14 +164,29 @@ def train(args):
   args = add_arguments(args)
   model = ParaphraseGPT(args)
   model = model.to(device)
+  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  total_params = sum(p.numel() for p in model.parameters())
+  print("Trainable params:", trainable_params)
+  print("Total params:", total_params)
 
   lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
+  optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+  total_steps = len(para_train_dataloader) * args.epochs
+  num_warmup_steps = int(0.1 * total_steps)  # 10% warmup
+  def lr_lambda(current_step):
+    if current_step < num_warmup_steps:
+      return float(current_step) / float(max(1, num_warmup_steps))
+    progress = float(current_step - num_warmup_steps) / float(max(1, total_steps - num_warmup_steps))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))  # cosine decay
+  scheduler = LambdaLR(optimizer, lr_lambda)
   best_dev_acc = 0
+  gpu_meter = GpuMeter(device)
+  metrics = []
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
+    gpu_meter.reset_epoch()
     train_loss = 0
     num_batches = 0
     for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
@@ -128,12 +197,16 @@ def train(args):
       labels = labels.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
-      optimizer.zero_grad()
+      optimizer.zero_grad(set_to_none=True)
+      # start recording GPU time
+      gpu_meter.step_start()
       logits = model(b_ids, b_mask)
-      preds = torch.argmax(logits, dim=1)
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
+      torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
       optimizer.step()
+      scheduler.step()
+      gpu_meter.step_end()
 
       train_loss += loss.item()
       num_batches += 1
@@ -147,13 +220,40 @@ def train(args):
       save_model(model, optimizer, args, args.filepath)
 
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
+    stats = gpu_meter.get_stats()
+    if stats is not None:
+      metrics.append({
+        "epoch": epoch,
+        "epoch_gpu_time_s": stats["epoch_gpu_time_s"],
+        "avg_step_time_ms": stats["avg_step_time_ms"],
+        "peak_alloc_mib": stats["peak_alloc_mib"],
+        "peak_reserved_mib": stats["peak_reserved_mib"],
+        "trainable_params": trainable_params,
+        "total_params": total_params
+      })
+
+      print(
+        f"[GPU] epoch={epoch} "
+        f"time={stats['epoch_gpu_time_s']:.2f}s "
+        f"step={stats['avg_step_time_ms']:.2f}ms "
+        f"mem={stats['peak_alloc_mib']:.1f}MiB"
+      )
+  # write metrics to CSV file.
+  if len(metrics) > 0:
+    with open("paraphrase_training_metrics_full.csv", "w", newline="") as f:
+      writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
+      writer.writeheader()
+      writer.writerows(metrics)
+
+    print("Saved metrics to paraphrase_training_metrics_full.csv")
 
 
 @torch.no_grad()
 def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(args.filepath)
+  print("Device:", device)
+  saved = torch.load(args.filepath, weights_only=False)
 
   model = ParaphraseGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -197,11 +297,11 @@ def get_args():
   parser.add_argument("--para_test_out", type=str, default="predictions/para-test-output.csv")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--epochs", type=int, default=8)
   parser.add_argument("--use_gpu", action='store_true')
 
-  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=16)
+  parser.add_argument("--lr", type=float, help="learning rate", default=2e-5)
   parser.add_argument("--model_size", type=str,
                       help="The model size as specified on hugging face. DO NOT use the xl model.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large'], default='gpt2')
