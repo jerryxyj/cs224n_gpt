@@ -8,6 +8,7 @@ trains your SonnetGPT model and writes the required submission files.
 '''
 
 import argparse
+import csv
 import random
 import torch
 
@@ -40,6 +41,54 @@ def seed_everything(seed=11711):
   torch.backends.cudnn.benchmark = False
   torch.backends.cudnn.deterministic = True
 
+def bytes_to_mib(x):
+  return x / (1024 ** 2)
+
+class GpuMeter:
+  def __init__(self, device):
+    self.enabled = device.type == "cuda"
+    print("GPU meter enabled: ", self.enabled)
+    if self.enabled:
+      self.start = torch.cuda.Event(enable_timing=True)
+      self.end = torch.cuda.Event(enable_timing=True)
+
+    self.step_time_sum = 0.0
+    self.step_count = 0
+
+  def reset_epoch(self):
+    self.step_time_sum = 0.0
+    self.step_count = 0
+
+    if self.enabled:
+      torch.cuda.reset_peak_memory_stats()
+
+  def step_start(self):
+    if self.enabled:
+      self.start.record()
+
+  def step_end(self):
+    if self.enabled:
+      self.end.record()
+      torch.cuda.synchronize()
+
+      self.step_time_sum += self.start.elapsed_time(self.end)
+      self.step_count += 1
+
+  def get_stats(self):
+    if not self.enabled:
+      return None
+
+    peak_alloc = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+
+    avg_step = self.step_time_sum / max(1, self.step_count)
+
+    return {
+      "epoch_gpu_time_s": self.step_time_sum / 1000,
+      "avg_step_time_ms": avg_step,
+      "peak_alloc_mib": bytes_to_mib(peak_alloc),
+      "peak_reserved_mib": bytes_to_mib(peak_reserved)
+    }
 
 class SonnetGPT(nn.Module):
   """Your GPT-2 Model designed for paraphrase detection."""
@@ -154,8 +203,17 @@ def train(args):
   model = SonnetGPT(args)
   model = model.to(device)
 
+  # Print the number of parameters in the model.
+  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  total_params = sum(p.numel() for p in model.parameters())
+  print("Trainable params:", trainable_params)
+  print("Total params:", total_params)
+
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
+
+  gpu_meter = GpuMeter(device)
+  metrics = []
 
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
@@ -170,13 +228,18 @@ def train(args):
       b_mask = b_mask.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
-      optimizer.zero_grad()
+      optimizer.zero_grad(set_to_none=True)
+      # start recording GPU time
+      gpu_meter.step_start()
+
       logits = model(b_ids, b_mask)
       logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # Ignore the last prediction in the sequence.
       labels = b_ids[:, 1:].contiguous().flatten()  # Ignore the first token to compose the labels.
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
+
+      gpu_meter.step_end()
 
       train_loss += loss.item()
       num_batches += 1
@@ -193,6 +256,30 @@ def train(args):
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
     save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
 
+    stats = gpu_meter.get_stats()
+    if stats is not None:
+      metrics.append({
+        "epoch": epoch,
+        "epoch_gpu_time_s": stats["epoch_gpu_time_s"],
+        "avg_step_time_ms": stats["avg_step_time_ms"],
+        "peak_alloc_mib": stats["peak_alloc_mib"],
+        "peak_reserved_mib": stats["peak_reserved_mib"],
+        "trainable_params": trainable_params,
+        "total_params": total_params
+      })
+      print(
+        f"[GPU] epoch={epoch} "
+        f"time={stats['epoch_gpu_time_s']:.2f}s "
+        f"step={stats['avg_step_time_ms']:.2f}ms "
+        f"mem={stats['peak_alloc_mib']:.1f}MiB"
+      )
+  # write metrics to CSV file.
+  if len(metrics) > 0:
+    with open("paraphrase_training_metrics_full.csv", "w", newline="") as f:
+      writer = csv.DictWriter(f, fieldnames=metrics[0].keys())
+      writer.writeheader()
+      writer.writerows(metrics)
+    print("Saved metrics to paraphrase_training_metrics_full.csv")
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
@@ -233,7 +320,7 @@ def get_args():
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=10)
+  parser.add_argument("--epochs", type=int, default=20)
   parser.add_argument("--use_gpu", action='store_true')
 
   # Generation parameters.
@@ -241,10 +328,10 @@ def get_args():
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
                       default=0.9)
 
-  parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
-  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
+  parser.add_argument("--batch_size", help='The training batch size.', type=int, default=16)
+  parser.add_argument("--lr", type=float, help="learning rate", default=5e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
+                      choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2-xl')
 
   args = parser.parse_args()
   return args
@@ -277,5 +364,5 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  train(args)
+  # train(args)
   generate_submission_sonnets(args)
