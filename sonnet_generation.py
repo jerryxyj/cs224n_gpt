@@ -320,7 +320,7 @@ def get_args():
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
-  parser.add_argument("--epochs", type=int, default=20)
+  parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
 
   # Generation parameters.
@@ -328,10 +328,10 @@ def get_args():
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
                       default=0.9)
 
-  parser.add_argument("--batch_size", help='The training batch size.', type=int, default=16)
-  parser.add_argument("--lr", type=float, help="learning rate", default=5e-5)
+  parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
+  parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
-                      choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2-xl')
+                      choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 
   args = parser.parse_args()
   return args
@@ -364,5 +364,5 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  # train(args)
+  train(args)
   generate_submission_sonnets(args)
