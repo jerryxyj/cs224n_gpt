@@ -25,6 +25,7 @@ from datasets import (
   SonnetsDataset,
 )
 from models.gpt2 import GPT2Model
+from modules.lora import apply_lora_to_model
 
 from optimizer import AdamW
 
@@ -99,9 +100,28 @@ class SonnetGPT(nn.Module):
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # By default, fine-tune the full model. TODO: this is maybe not idea.
-    for param in self.gpt.parameters():
-      param.requires_grad = True
+    self.use_lora = getattr(args, 'use_lora', False)
+
+    if self.use_lora:
+      # Freeze all base model parameters first.
+      for param in self.gpt.parameters():
+        param.requires_grad = False
+
+      # Parse target modules from comma-separated string.
+      target_modules = getattr(args, 'lora_targets', 'query,value').split(',')
+      lora_r = getattr(args, 'lora_r', 8)
+      lora_alpha = getattr(args, 'lora_alpha', 16.0)
+      lora_dropout = getattr(args, 'lora_dropout', 0.05)
+
+      # Apply LoRA adapters to the specified target modules.
+      apply_lora_to_model(
+        self.gpt, r=lora_r, alpha=lora_alpha,
+        dropout=lora_dropout, target_modules=target_modules
+      )
+    else:
+      # Full fine-tuning: all parameters are trainable.
+      for param in self.gpt.parameters():
+        param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
@@ -332,6 +352,19 @@ def get_args():
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
+
+  # LoRA arguments.
+  parser.add_argument("--use_lora", action='store_true',
+                      help="Enable LoRA for parameter-efficient fine-tuning.")
+  parser.add_argument("--lora_r", type=int, default=8,
+                      help="Rank of the LoRA low-rank matrices.")
+  parser.add_argument("--lora_alpha", type=float, default=16.0,
+                      help="Scaling factor for LoRA (effective scaling = alpha/r).")
+  parser.add_argument("--lora_dropout", type=float, default=0.05,
+                      help="Dropout rate applied before the LoRA path.")
+  parser.add_argument("--lora_targets", type=str, default='query,value',
+                      help="Comma-separated list of modules to apply LoRA to. "
+                           "Options: query, key, value, attention_dense, interm_dense, out_dense")
 
   args = parser.parse_args()
   return args
